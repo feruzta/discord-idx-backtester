@@ -1,10 +1,32 @@
 import axios from "npm:axios@1.12.2";
 import nacl from "npm:tweetnacl@1.0.3";
+import { IDX_SYMBOLS, IDX_SYMBOLS_UPDATED_AT } from "./idx_symbols.ts";
+
+interface Candle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+interface ScannerCandle extends Candle {
+  ema8: number;
+  ema21: number;
+  ema125: number;
+  atr14: number | null;
+  volumeSma20: number | null;
+}
+
+type SetupStatus =
+  | "NO_SETUP" | "BULLISH_TREND" | "WAIT_PULLBACK" | "PULLBACK"
+  | "WAIT_CONFIRMATION" | "WAIT_BREAKOUT" | "READY_BUY" | "INVALID";
 
 /*
-Deno Deploy endpoint for Discord `/backtest`.
+Deno Deploy endpoint for Discord `/backtest`, `/technical`, and `/scan`.
 
-Required Pipedream environment variables:
+Required Deno Deploy environment variables:
   DISCORD_PUBLIC_KEY
   DISCORD_BOT_TOKEN
 */
@@ -23,7 +45,7 @@ function hexToBytes(hex: string) {
 Deno.serve(async (request: Request) => {
   const requestUrl = new URL(request.url);
 
-  // One-time protected route for registering `/backtest` globally.
+  // One-time protected route for registering all Discord commands globally.
   if (request.method === "GET" && requestUrl.pathname === "/register-global") {
     const suppliedKey = requestUrl.searchParams.get("key");
     const registerSecret = Deno.env.get("REGISTER_SECRET");
@@ -34,9 +56,8 @@ Deno.serve(async (request: Request) => {
       const command = await registerGlobalCommand();
       return jsonResponse({
         success: true,
-        message: "/backtest berhasil didaftarkan sebagai global command",
-        command_id: command.id,
-        command_name: command.name,
+        message: "/backtest, /technical, dan /scan berhasil didaftarkan sebagai global command",
+        commands: [command.backtest.name, command.technical.name, command.scan.name],
       });
     } catch (error) {
       return jsonResponse({ success: false, error: discordErrorDetail(error) }, 500);
@@ -64,14 +85,43 @@ Deno.serve(async (request: Request) => {
 
   const interaction = JSON.parse(rawBody);
   if (interaction.type === 1) return jsonResponse({ type: 1 });
-  if (interaction.type !== 2 || interaction.data?.name !== "backtest") {
+  const commandName = interaction.data?.name;
+  if (interaction.type !== 2 || !["backtest", "technical", "scan"].includes(commandName)) {
     return jsonResponse({ type: 4, data: { content: "Command tidak dikenali.", flags: 64 } });
   }
 
   const options = Object.fromEntries(
     (interaction.data.options || []).map((option: { name: string; value: unknown }) => [option.name, option.value]),
   );
+
+  if (commandName === "scan") {
+    const supplied = String(options.symbols ?? "");
+    const symbols = supplied
+      ? [...new Set(supplied.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))]
+      : IDX_SYMBOLS;
+    setTimeout(() => {
+      runScannerJob(interaction.channel_id, botToken, symbols)
+        .catch((error) => console.error("Scanner job failed", error));
+    }, 0);
+    return jsonResponse({
+      type: 4,
+      data: { content: `🔎 Memeriksa lonjakan volume **${symbols.length} emiten**. Top 5 akan dianalisis pada 15m + 5m…` },
+    });
+  }
+
   const ticker = normalizeTicker(options.ticker || "DMAS");
+
+  if (commandName === "technical") {
+    setTimeout(() => {
+      runTechnicalJob(interaction.channel_id, botToken, ticker)
+        .catch((error) => console.error("Technical job failed", error));
+    }, 0);
+    return jsonResponse({
+      type: 4,
+      data: { content: `⏳ Analisis Daily **${ticker}** sedang diproses…` },
+    });
+  }
+
   const feeBuy = Number(options.fee_beli ?? 0.15) / 100;
   const feeSell = Number(options.fee_jual ?? 0.25) / 100;
   const slippage = Number(options.slippage ?? 0.10) / 100;
@@ -94,7 +144,7 @@ async function registerGlobalCommand() {
   if (!applicationId) throw new Error("DISCORD_APPLICATION_ID belum diisi.");
   if (!botToken) throw new Error("DISCORD_BOT_TOKEN belum diisi.");
 
-  const command = {
+  const backtestCommand = {
     name: "backtest",
     type: 1,
     description: "Cari strategi terbaik dan rekomendasi entry saham IDX",
@@ -106,15 +156,49 @@ async function registerGlobalCommand() {
     ],
   };
 
-  const response = await axios.post(
+  const technicalCommand = {
+    name: "technical",
+    type: 1,
+    description: "Analisis teknikal Daily dan rencana entry saham IDX",
+    options: [
+      { name: "ticker", description: "Kode emiten, contoh DMAS", type: 3, required: true, min_length: 2, max_length: 12 },
+    ],
+  };
+
+  const scanCommand = {
+    name: "scan",
+    type: 1,
+    description: "Scan setup EMA 8/21/125 pada daftar saham IDX",
+    options: [
+      { name: "symbols", description: "Opsional untuk test, contoh DMAS,BBCA,IMJS; kosong scan seluruh IDX", type: 3, required: false, max_length: 500 },
+    ],
+  };
+
+  const first = await axios.post(
     `https://discord.com/api/v10/applications/${applicationId}/commands`,
-    command,
+    backtestCommand,
     {
       headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
       timeout: 30000,
     },
   );
-  return response.data;
+  const second = await axios.post(
+    `https://discord.com/api/v10/applications/${applicationId}/commands`,
+    technicalCommand,
+    {
+      headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
+      timeout: 30000,
+    },
+  );
+  const third = await axios.post(
+    `https://discord.com/api/v10/applications/${applicationId}/commands`,
+    scanCommand,
+    {
+      headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
+      timeout: 30000,
+    },
+  );
+  return { backtest: first.data, technical: second.data, scan: third.data };
 }
 
 async function runBacktestJob(
@@ -154,6 +238,542 @@ async function runBacktestJob(
       console.error("Could not send error to Discord", sendError);
     }
   }
+}
+
+async function runTechnicalJob(channelId: string, botToken: string | undefined, ticker: string) {
+  try {
+    let daily = await fetchYahooBars(ticker, "2y", "1d");
+    if (daily.length < 220) throw new Error("Data Daily kurang dari 220 candle; analisis EMA200 belum layak.");
+    const candleStatus = latestDailyCandleStatus(daily.at(-1).time);
+    if (candleStatus === "berjalan" && daily.length > 220) daily = daily.slice(0, -1);
+    const bars = enrich(daily);
+    const analysis = analyzeDaily(bars);
+    await sendChannelMessage(channelId, botToken, formatTechnicalReport(ticker, bars, analysis, candleStatus));
+  } catch (error) {
+    const detail = discordErrorDetail(error);
+    try {
+      await sendChannelMessage(channelId, botToken, `❌ **Analisis ${ticker} gagal**\n${detail.slice(0, 1500)}`);
+    } catch (sendError) {
+      console.error("Could not send technical error", sendError);
+    }
+  }
+}
+
+const STATUS_PRIORITY: Record<SetupStatus, number> = {
+  READY_BUY: 0,
+  WAIT_BREAKOUT: 1,
+  WAIT_CONFIRMATION: 2,
+  PULLBACK: 3,
+  WAIT_PULLBACK: 4,
+  BULLISH_TREND: 5,
+  NO_SETUP: 6,
+  INVALID: 7,
+};
+
+async function runScannerJob(
+  channelId: string,
+  botToken: string | undefined,
+  rawSymbols: string[],
+) {
+  const symbols = rawSymbols.map(normalizeTicker);
+  const volumeCandidates = await findTopVolumeSpikes(symbols, 5);
+  if (!volumeCandidates.length) {
+    await sendChannelMessage(
+      channelId,
+      botToken,
+      `🔎 **VOLUME PRE-SCREEN**\nTidak ada emiten dengan volume hari ini ≥2× rata-rata 7 hari dari ${symbols.length} ticker yang berhasil diperiksa.`,
+    );
+    return;
+  }
+  const results = await mapWithConcurrency(volumeCandidates, 3, async (candidate): Promise<ScannerResult> => {
+    const symbol = candidate.symbol;
+    try {
+      const [raw5m, raw15m] = await Promise.all([
+        fetchYahooBars(symbol, "60d", "5m"),
+        fetchYahooBars(symbol, "60d", "15m"),
+      ]);
+      const candles5m = prepareScannerCandles(onlyClosedCandles(raw5m, 5 * 60));
+      const candles15m = prepareScannerCandles(onlyClosedCandles(raw15m, 15 * 60));
+      return {
+        ...analyzeSetup(candles5m, candles15m, symbol.replace(/\.JK$/, "")),
+        volumeRatio7d: candidate.volumeRatio7d,
+      };
+    } catch (error) {
+      return {
+        ...scannerErrorResult(symbol.replace(/\.JK$/, ""), discordErrorDetail(error)),
+        volumeRatio7d: candidate.volumeRatio7d,
+      };
+    }
+  });
+
+  results.sort((a, b) =>
+    STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status] ||
+    b.score - a.score ||
+    a.proximityPct - b.proximityPct ||
+    b.averageVolume20 - a.averageVolume20
+  );
+  await sendChannelMessage(channelId, botToken, formatScannerReport(results, symbols.length, volumeCandidates.length));
+}
+
+interface VolumeCandidate {
+  symbol: string;
+  currentVolume: number;
+  averageVolume7d: number;
+  volumeRatio7d: number;
+}
+
+async function findTopVolumeSpikes(symbols: string[], limit: number): Promise<VolumeCandidate[]> {
+  const checked = await mapWithConcurrency(symbols, 6, async (symbol): Promise<VolumeCandidate | null> => {
+    try {
+      const daily = await fetchYahooBars(symbol, "1mo", "1d");
+      if (daily.length < 8) return null;
+      const currentVolume = daily.at(-1)!.volume;
+      const previousSeven = daily.slice(-8, -1).map((c) => c.volume).filter((volume) => volume > 0);
+      if (currentVolume <= 0 || previousSeven.length < 7) return null;
+      const averageVolume7d = previousSeven.reduce((sum, volume) => sum + volume, 0) / previousSeven.length;
+      const volumeRatio7d = currentVolume / averageVolume7d;
+      return volumeRatio7d >= 2
+        ? { symbol, currentVolume, averageVolume7d, volumeRatio7d }
+        : null;
+    } catch {
+      return null;
+    }
+  });
+  return checked
+    .filter((candidate): candidate is VolumeCandidate => candidate != null)
+    .sort((a, b) => b.volumeRatio7d - a.volumeRatio7d || b.currentVolume - a.currentVolume)
+    .slice(0, limit);
+}
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>) {
+  const output = new Array<R>(items.length);
+  let cursor = 0;
+  async function consume() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      output[index] = await worker(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, consume));
+  return output;
+}
+
+function onlyClosedCandles(candles: Candle[], intervalSeconds: number): Candle[] {
+  const now = Math.floor(Date.now() / 1000);
+  return candles.filter((c) => c.time + intervalSeconds <= now);
+}
+
+function calculateEmaSeries(candles: Candle[], period: number): number[] {
+  const alpha = 2 / (period + 1);
+  const result = new Array<number>(candles.length);
+  let value = candles[0]?.close ?? 0;
+  for (let i = 0; i < candles.length; i++) {
+    value = i === 0 ? candles[i].close : candles[i].close * alpha + value * (1 - alpha);
+    result[i] = value;
+  }
+  return result;
+}
+
+function calculateAtrSeries(candles: Candle[], period = 14): Array<number | null> {
+  const result: Array<number | null> = new Array(candles.length).fill(null);
+  let atr = 0;
+  for (let i = 1; i < candles.length; i++) {
+    const tr = Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close),
+    );
+    if (i < period) atr += tr;
+    else if (i === period) {
+      atr = (atr + tr) / period;
+      result[i] = atr;
+    } else {
+      atr = (atr * (period - 1) + tr) / period;
+      result[i] = atr;
+    }
+  }
+  return result;
+}
+
+function prepareScannerCandles(candles: Candle[]): ScannerCandle[] {
+  if (!candles.length) return [];
+  const ema8 = calculateEmaSeries(candles, 8);
+  const ema21 = calculateEmaSeries(candles, 21);
+  const ema125 = calculateEmaSeries(candles, 125);
+  const atr14 = calculateAtrSeries(candles, 14);
+  return candles.map((c, i) => ({
+    ...c,
+    ema8: ema8[i],
+    ema21: ema21[i],
+    ema125: ema125[i],
+    atr14: atr14[i],
+    volumeSma20: i < 19 ? null : candles.slice(i - 19, i + 1).reduce((sum, x) => sum + x.volume, 0) / 20,
+  }));
+}
+
+interface ConfirmedPivot {
+  index: number;
+  time: number;
+  price: number;
+}
+
+function confirmedPivots(
+  candles: ScannerCandle[],
+  pivotLength = 3,
+): { highs: ConfirmedPivot[]; lows: ConfirmedPivot[] } {
+  const highs: ConfirmedPivot[] = [];
+  const lows: ConfirmedPivot[] = [];
+  // The loop stops pivotLength candles before the end, so every pivot has
+  // three already-closed candles on its right and never uses future data.
+  for (let i = pivotLength; i <= candles.length - 1 - pivotLength; i++) {
+    let isHigh = true, isLow = true;
+    for (let offset = 1; offset <= pivotLength; offset++) {
+      isHigh &&= candles[i].high > candles[i - offset].high && candles[i].high > candles[i + offset].high;
+      isLow &&= candles[i].low < candles[i - offset].low && candles[i].low < candles[i + offset].low;
+    }
+    if (isHigh) highs.push({ index: i, time: candles[i].time, price: candles[i].high });
+    if (isLow) lows.push({ index: i, time: candles[i].time, price: candles[i].low });
+  }
+  return { highs, lows };
+}
+
+function idxTickSize(price: number): number {
+  if (price < 200) return 1;
+  if (price < 500) return 2;
+  if (price < 2000) return 5;
+  if (price < 5000) return 10;
+  return 25;
+}
+
+function roundToIdxTick(price: number, direction: "up" | "down"): number {
+  let candidate = Math.max(price, 1);
+  for (let tries = 0; tries < 4; tries++) {
+    const tick = idxTickSize(candidate);
+    const rounded = (direction === "up" ? Math.ceil(candidate / tick) : Math.floor(candidate / tick)) * tick;
+    if (idxTickSize(rounded) === tick) return rounded;
+    candidate = rounded;
+  }
+  return candidate;
+}
+
+interface ScoreBreakdown {
+  aboveEMA125: number;
+  ema125Rising: number;
+  emaAlignment: number;
+  emaSlope: number;
+  higherHigh: number;
+  higherLow: number;
+  pullback: number;
+  structureHeld: number;
+  confirmation: number;
+  volume: number;
+}
+
+interface ScannerResult {
+  symbol: string;
+  score: number;
+  status: SetupStatus;
+  trend: string;
+  ema8: number | null;
+  ema21: number | null;
+  ema125: number | null;
+  atr14: number | null;
+  latestPivotHigh: number | null;
+  previousPivotHigh: number | null;
+  latestPivotLow: number | null;
+  previousPivotLow: number | null;
+  higherHigh: boolean;
+  higherLow: boolean;
+  pullbackDetected: boolean;
+  pullbackLow: number | null;
+  confirmationDetected: boolean;
+  confirmationHigh: number | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  riskReward: number | null;
+  scoreBreakdown: ScoreBreakdown;
+  proximityPct: number;
+  averageVolume20: number;
+  volumeRatio7d?: number;
+  error?: string;
+}
+
+function emptyScore(): ScoreBreakdown {
+  return { aboveEMA125: 0, ema125Rising: 0, emaAlignment: 0, emaSlope: 0, higherHigh: 0, higherLow: 0, pullback: 0, structureHeld: 0, confirmation: 0, volume: 0 };
+}
+
+function scannerErrorResult(symbol: string, error: string): ScannerResult {
+  return {
+    symbol, score: 0, status: "INVALID", trend: "NONE", ema8: null, ema21: null,
+    ema125: null, atr14: null, latestPivotHigh: null, previousPivotHigh: null,
+    latestPivotLow: null, previousPivotLow: null, higherHigh: false, higherLow: false,
+    pullbackDetected: false, pullbackLow: null, confirmationDetected: false,
+    confirmationHigh: null, entryPrice: null, stopLoss: null, takeProfit: null,
+    riskReward: null, scoreBreakdown: emptyScore(), proximityPct: Infinity,
+    averageVolume20: 0, error,
+  };
+}
+
+function analyzeSetup(candles5m: ScannerCandle[], candles15m: ScannerCandle[], symbol: string): ScannerResult {
+  const base: ScannerResult = {
+    symbol, score: 0, status: "NO_SETUP" as SetupStatus, trend: "NONE",
+    ema8: null as number | null, ema21: null as number | null, ema125: null as number | null,
+    atr14: null as number | null,
+    latestPivotHigh: null as number | null, previousPivotHigh: null as number | null,
+    latestPivotLow: null as number | null, previousPivotLow: null as number | null,
+    higherHigh: false, higherLow: false, pullbackDetected: false,
+    pullbackLow: null as number | null, confirmationDetected: false,
+    confirmationHigh: null as number | null, entryPrice: null as number | null,
+    stopLoss: null as number | null, takeProfit: null as number | null,
+    riskReward: null as number | null, scoreBreakdown: emptyScore(),
+    proximityPct: Infinity, averageVolume20: 0,
+  };
+  if (candles15m.length < 135 || candles5m.length < 135) return { ...base, status: "INVALID" as SetupStatus, error: "History candle tidak cukup" };
+
+  const h = candles15m.at(-1)!;
+  const h5 = candles15m.at(-6)!;
+  const hp = candles15m.at(-2)!;
+  const breakdown = emptyScore();
+  const aboveEMA125 = h.close > h.ema125;
+  const ema125Rising = h.ema125 > h5.ema125;
+  const emaAlignment = h.ema8 > h.ema21;
+  const ema8Rising = h.ema8 > hp.ema8;
+  const ema21Rising = h.ema21 > hp.ema21;
+  breakdown.aboveEMA125 = aboveEMA125 ? 10 : 0;
+  breakdown.ema125Rising = ema125Rising ? 10 : 0;
+  breakdown.emaAlignment = emaAlignment ? 10 : 0;
+  breakdown.emaSlope = ema8Rising && ema21Rising ? 10 : 0;
+  const preScreenPassed = aboveEMA125 && ema125Rising && emaAlignment && ema8Rising && ema21Rising && h.volume > 0;
+  if (!preScreenPassed) {
+    const score = Object.values(breakdown).reduce((sum, x) => sum + x, 0);
+    return { ...base, ema8: h.ema8, ema21: h.ema21, ema125: h.ema125, atr14: h.atr14, score, scoreBreakdown: breakdown, averageVolume20: h.volumeSma20 ?? 0 };
+  }
+
+  const pivots = confirmedPivots(candles15m, 3);
+  if (pivots.highs.length < 2 || pivots.lows.length < 2) {
+    return { ...base, status: "BULLISH_TREND" as SetupStatus, trend: "BULLISH", ema8: h.ema8, ema21: h.ema21, ema125: h.ema125, atr14: h.atr14, score: 40, scoreBreakdown: breakdown, averageVolume20: h.volumeSma20 ?? 0 };
+  }
+  const latestHigh = pivots.highs.at(-1)!, previousHigh = pivots.highs.at(-2)!;
+  const latestLow = pivots.lows.at(-1)!, previousLow = pivots.lows.at(-2)!;
+  const higherHigh = latestHigh.price > previousHigh.price;
+  const higherLow = latestLow.price > previousLow.price;
+  breakdown.higherHigh = higherHigh ? 10 : 0;
+  breakdown.higherLow = higherLow ? 15 : 0;
+  if (!higherHigh || !higherLow) {
+    const score = Object.values(breakdown).reduce((sum, x) => sum + x, 0);
+    return { ...base, status: "NO_SETUP" as SetupStatus, trend: "BULLISH_FILTER_ONLY", ema8: h.ema8, ema21: h.ema21, ema125: h.ema125, atr14: h.atr14, latestPivotHigh: latestHigh.price, previousPivotHigh: previousHigh.price, latestPivotLow: latestLow.price, previousPivotLow: previousLow.price, higherHigh, higherLow, score, scoreBreakdown: breakdown, averageVolume20: h.volumeSma20 ?? 0 };
+  }
+
+  const current = candles5m.at(-1)!;
+  const scanStart = Math.max(130, candles5m.length - 60);
+  let pullbackIndex: number | null = null, pullbackLow: number | null = null;
+  let confirmationIndex: number | null = null, confirmationHigh: number | null = null;
+  let invalid = false;
+  for (let i = scanStart; i < candles5m.length; i++) {
+    const c = candles5m[i];
+    const atr = c.atr14;
+    if (!atr) continue;
+    const setupExisted = pullbackIndex != null || confirmationIndex != null;
+    if (setupExisted && (c.close < latestLow.price || c.ema8 < c.ema21 || c.close < c.ema125)) {
+      invalid = true; break;
+    }
+    const validPullback = c.low <= c.ema8 && c.low >= c.ema21 - 0.25 * atr && c.low > latestLow.price;
+    if (validPullback && confirmationIndex == null) {
+      pullbackIndex ??= i;
+      pullbackLow = pullbackLow == null ? c.low : Math.min(pullbackLow, c.low);
+    }
+    if (pullbackIndex != null && i > pullbackIndex && confirmationIndex == null) {
+      const range = c.high - c.low;
+      const body = c.close - c.open;
+      const confirmation = range > 0 && c.close > c.open && body / range >= 0.5 &&
+        (c.close - c.low) / range >= 0.7 && c.close > c.ema8;
+      if (confirmation) {
+        confirmationIndex = i;
+        confirmationHigh = c.high;
+      }
+    }
+  }
+
+  const pullbackDetected = pullbackIndex != null;
+  const confirmationDetected = confirmationIndex != null && confirmationHigh != null;
+  const structureHeld = pullbackDetected && !invalid && pullbackLow! > latestLow.price;
+  const volumeAvailable = current.volumeSma20 != null;
+  const volumeConfirmed = confirmationIndex != null &&
+    candles5m[confirmationIndex].volumeSma20 != null &&
+    candles5m[confirmationIndex].volume > candles5m[confirmationIndex].volumeSma20!;
+  breakdown.pullback = pullbackDetected ? 15 : 0;
+  breakdown.structureHeld = structureHeld ? 10 : 0;
+  breakdown.confirmation = confirmationDetected ? 5 : 0;
+  breakdown.volume = volumeConfirmed ? 5 : 0;
+  let score = Object.values(breakdown).reduce((sum, x) => sum + x, 0);
+  if (!volumeAvailable) score = Math.round(score / 95 * 100);
+
+  let status: SetupStatus;
+  if (invalid) status = "INVALID";
+  else if (confirmationDetected) {
+    const broken = candles5m.slice(confirmationIndex! + 1).some((c) => c.high > confirmationHigh!);
+    status = broken ? "READY_BUY" : "WAIT_BREAKOUT";
+  } else if (pullbackDetected) {
+    const currentlyPullingBack = current.atr14 != null &&
+      current.low <= current.ema8 &&
+      current.low >= current.ema21 - 0.25 * current.atr14 &&
+      current.low > latestLow.price;
+    status = currentlyPullingBack ? "PULLBACK" : "WAIT_CONFIRMATION";
+  }
+  else status = current.close > current.ema8 + 0.5 * (current.atr14 ?? 0) ? "WAIT_PULLBACK" : "BULLISH_TREND";
+
+  const entryPrice = confirmationHigh == null ? null : roundToIdxTick(confirmationHigh + idxTickSize(confirmationHigh), "up");
+  let stopLoss = pullbackLow == null || current.atr14 == null ? null : roundToIdxTick(pullbackLow - 0.1 * current.atr14, "down");
+  if (entryPrice != null && stopLoss != null && stopLoss >= entryPrice) stopLoss = roundToIdxTick(entryPrice - idxTickSize(entryPrice), "down");
+  const risk = entryPrice != null && stopLoss != null ? entryPrice - stopLoss : null;
+  const takeProfit = risk != null && risk > 0 ? roundToIdxTick(entryPrice! + risk, "up") : null;
+  const proximityPct = confirmationHigh != null ? Math.max(confirmationHigh - current.close, 0) / current.close * 100 : Math.abs(current.low - current.ema8) / current.close * 100;
+
+  return {
+    ...base, symbol, score, status, trend: "BULLISH", ema8: current.ema8, ema21: current.ema21,
+    ema125: current.ema125, atr14: current.atr14, latestPivotHigh: latestHigh.price,
+    previousPivotHigh: previousHigh.price, latestPivotLow: latestLow.price,
+    previousPivotLow: previousLow.price, higherHigh, higherLow, pullbackDetected,
+    pullbackLow, confirmationDetected, confirmationHigh, entryPrice, stopLoss,
+    takeProfit, riskReward: risk != null && risk > 0 ? 1 : null, scoreBreakdown: breakdown,
+    proximityPct, averageVolume20: current.volumeSma20 ?? 0,
+  };
+}
+
+function formatScannerReport(results: ScannerResult[], requested: number, shortlisted: number): string {
+  const valid = results.filter((r) => !r.error);
+  const actionable = valid.filter((r) => STATUS_PRIORITY[r.status] <= STATUS_PRIORITY.WAIT_PULLBACK);
+  const rows = valid.slice(0, 10).map((r, i) => {
+    const levels = r.entryPrice == null ? "" : ` | E ${rupiahPrice(r.entryPrice)} SL ${rupiahPrice(r.stopLoss)} TP ${rupiahPrice(r.takeProfit)}`;
+    const volume = r.volumeRatio7d == null ? "" : ` | Vol ${r.volumeRatio7d.toFixed(2)}×`;
+    return `${i + 1}. **${r.symbol}** — ${r.status} | ${r.score}/100${volume}${levels}`;
+  });
+  return [
+    `🔎 **EMA STRUCTURE SCANNER — 15m + 5m**`,
+    `Universe: ${requested} | Top volume: ${shortlisted} | Dianalisis: ${valid.length} | Setup: ${actionable.length}`, "",
+    ...(rows.length ? rows : ["Tidak ada data yang berhasil dianalisis."]), "",
+    "15m: EMA125 rising + EMA8/21 rising + HH/HL.",
+    "5m: pullback → confirmation → break confirmation high.",
+    "Pivot Length 3 hanya memakai pivot yang sudah confirmed. Candle berjalan tidak digunakan.",
+    `Universe ticker diperbarui: ${IDX_SYMBOLS_UPDATED_AT}.`,
+    "_Scanner teknikal bukan jaminan hasil._",
+  ].join("\n").slice(0, 1950);
+}
+
+function latestDailyCandleStatus(unix: number) {
+  const nowParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  const get = (type: string) => nowParts.find((p) => p.type === type)?.value || "";
+  const today = `${get("year")}-${get("month")}-${get("day")}`;
+  const hour = Number(get("hour"));
+  const barDate = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(unix * 1000));
+  return barDate === today && hour < 16 ? "berjalan" : "selesai";
+}
+
+function uniqueLevels(values: number[], close: number) {
+  return values.filter(Number.isFinite).sort((a, b) => b - a).filter((v, i, arr) =>
+    i === 0 || Math.abs(v - arr[i - 1]) / close > 0.012
+  );
+}
+
+function analyzeDaily(bars) {
+  const i = bars.length - 1, b = bars[i], p = bars[i - 1];
+  const cloudTop = Math.max(b.spanA ?? -Infinity, b.spanB ?? -Infinity);
+  const cloudBottom = Math.min(b.spanA ?? Infinity, b.spanB ?? Infinity);
+  const high20 = rollingMax(bars, i - 1, 20, "high");
+  const high50 = rollingMax(bars, i - 1, 50, "high");
+  const low20 = rollingMin(bars, i, 20, "low");
+  const low50 = rollingMin(bars, i, 50, "low");
+  const atr = b.atr || b.close * 0.03;
+  const relativeVolume = b.volSma20 ? b.volume / b.volSma20 : 0;
+
+  let trendScore = 0;
+  if (b.close > b.ema20) trendScore++;
+  if (b.ema20 > b.ema50) trendScore++;
+  if (b.ema50 > b.ema200) trendScore++;
+  if (b.close > cloudTop) trendScore++;
+  if (b.tenkan > b.kijun) trendScore++;
+  const trend = trendScore >= 4 ? "BULLISH" : trendScore <= 1 ? "BEARISH" : "NETRAL";
+
+  const supports = uniqueLevels(
+    [b.ema20, b.ema50, b.kijun, cloudTop, cloudBottom, low20, low50].filter((x) => x <= b.close),
+    b.close,
+  );
+  const resistances = uniqueLevels(
+    [high20, high50].filter((x) => x > b.close * 1.002),
+    b.close,
+  ).sort((a, c) => a - c);
+  if (!resistances.length) resistances.push(b.close + atr, b.close + 2 * atr);
+  const support1 = supports[0] ?? b.close - atr;
+  const support2 = supports[1] ?? b.close - 2 * atr;
+  const resistance1 = resistances[0];
+  const resistance2 = resistances[1] ?? resistance1 + atr;
+  const stretched = b.close - b.ema20 > 1.5 * atr || b.rsi >= 70;
+  const nearSupport = b.close - support1 <= 0.65 * atr;
+  const nearResistance = resistance1 - b.close <= 0.55 * atr;
+  const bullishCandle = b.close > b.open && b.close > p.close;
+  const breakout = b.close > high20 && relativeVolume >= 1.2;
+
+  let status, reason, entryLow, entryHigh, stop, tp1, tp2;
+  if (trend === "BEARISH") {
+    status = "NO TRADE"; reason = "Struktur Daily masih bearish; tunggu reclaim EMA20 dan perbaikan tren.";
+  } else if (breakout && trend === "BULLISH") {
+    status = "ENTRY BREAKOUT AKTIF"; reason = "Daily close menembus resistance dengan volume ≥1,2× rata-rata.";
+    entryLow = high20; entryHigh = b.close; stop = Math.max(support1, entryLow - 1.3 * atr);
+  } else if (nearSupport && bullishCandle && trend === "BULLISH" && relativeVolume >= 0.9) {
+    status = "ENTRY PULLBACK AKTIF"; reason = "Harga berada dekat support dan menghasilkan konfirmasi candle bullish.";
+    entryLow = support1; entryHigh = b.close; stop = Math.min(support2, support1 - 1.1 * atr);
+  } else if (stretched || nearResistance) {
+    status = nearResistance ? "TUNGGU BREAKOUT" : "TUNGGU PULLBACK";
+    reason = nearResistance ? "Harga dekat resistance; jangan mengejar sebelum Daily close dan volume mengonfirmasi." : "Harga terlalu jauh dari EMA20/RSI tinggi; risk-reward entry sekarang kurang menarik.";
+    entryLow = nearResistance ? resistance1 : support1; entryHigh = nearResistance ? resistance1 + 0.25 * atr : Math.min(b.ema20, b.close);
+    stop = nearResistance ? Math.max(support1, resistance1 - 1.3 * atr) : Math.min(support2, support1 - atr);
+  } else {
+    status = "TUNGGU PULLBACK"; reason = "Tren belum memberikan trigger entry dengan risk-reward yang cukup.";
+    entryLow = support1; entryHigh = Math.min(b.ema20, b.close); stop = Math.min(support2, support1 - atr);
+  }
+  if (entryLow != null) {
+    const referenceEntry = Math.max(entryLow, entryHigh);
+    const risk = Math.max(referenceEntry - stop, atr * 0.8);
+    tp1 = Math.max(resistance1, referenceEntry + risk);
+    tp2 = Math.max(resistance2, referenceEntry + 2 * risk);
+  }
+  return {
+    trend, trendScore, relativeVolume, support1, support2, resistance1, resistance2,
+    status, reason, entryLow, entryHigh, stop, tp1, tp2,
+    rsi: b.rsi, macdHist: b.macdHist, macdImproving: b.macdHist > p.macdHist,
+    aboveCloud: b.close > cloudTop, atrPct: atr / b.close * 100,
+  };
+}
+
+function formatTechnicalReport(ticker, bars, a, ignoredCandleStatus) {
+  const b = bars.at(-1);
+  const macd = a.macdHist > 0 ? (a.macdImproving ? "bullish menguat" : "bullish melemah") : (a.macdImproving ? "bearish membaik" : "bearish melemah");
+  const rsiState = a.rsi >= 70 ? "overbought" : a.rsi <= 30 ? "oversold" : a.rsi >= 55 ? "bullish" : a.rsi <= 45 ? "bearish" : "netral";
+  const entryMin = a.entryLow == null ? null : Math.min(a.entryLow, a.entryHigh);
+  const entryMax = a.entryLow == null ? null : Math.max(a.entryLow, a.entryHigh);
+  const entry = entryMin == null ? "Entry: –" : `Area entry: **${rupiahPrice(entryMin)}–${rupiahPrice(entryMax)}**\nSL: **${rupiahPrice(a.stop)}** | TP1: **${rupiahPrice(a.tp1)}** | TP2: **${rupiahPrice(a.tp2)}**`;
+  return [
+    `📈 **TECHNICAL ${ticker} — DAILY**`,
+    `Data: ${wib(b.time)} | Close: **${rupiahPrice(b.close)}**`,
+    ignoredCandleStatus === "berjalan" ? "_Candle hari ini belum selesai dan dikeluarkan dari analisis._" : "_Menggunakan candle Daily yang sudah selesai._", "",
+    `**TREND: ${a.trend} (${a.trendScore}/5)**`,
+    `EMA20 ${rupiahPrice(b.ema20)} | EMA50 ${rupiahPrice(b.ema50)} | EMA200 ${rupiahPrice(b.ema200)}`,
+    `Ichimoku: ${a.aboveCloud ? "harga di atas Kumo" : "harga belum di atas Kumo"}`, "",
+    `**MOMENTUM**`,
+    `RSI14: ${a.rsi.toFixed(1)} — ${rsiState}`,
+    `MACD histogram: ${a.macdHist.toFixed(2)} — ${macd}`,
+    `Volume: ${a.relativeVolume.toFixed(2)}× rata-rata 20 hari | ATR: ${a.atrPct.toFixed(2)}%`, "",
+    `**LEVEL**`,
+    `Support: **${rupiahPrice(a.support1)}** / **${rupiahPrice(a.support2)}**`,
+    `Resistance: **${rupiahPrice(a.resistance1)}** / **${rupiahPrice(a.resistance2)}**`, "",
+    `🎯 **${a.status}**`, a.reason, entry, "",
+    "Konfirmasi entry menggunakan candle Daily yang sudah close. _Analisis teknikal bukan jaminan hasil._",
+  ].join("\n").slice(0, 1950);
 }
 
 function normalizeTicker(value) {
@@ -213,12 +833,23 @@ function std(bars, i, n) {
 
 function enrich(input) {
   const bars = input.map((b) => ({ ...b }));
-  let ema9 = null, ema21 = null, avgGain = null, avgLoss = null, atr = null;
+  let ema9 = null, ema12 = null, ema20 = null, ema21 = null, ema26 = null;
+  let ema50 = null, ema200 = null, macdSignal = null;
+  let avgGain = null, avgLoss = null, atr = null;
   for (let i = 0; i < bars.length; i++) {
     const b = bars[i];
     ema9 = ema9 == null ? b.close : b.close * 0.2 + ema9 * 0.8;
+    ema12 = ema12 == null ? b.close : b.close * (2 / 13) + ema12 * (11 / 13);
+    ema20 = ema20 == null ? b.close : b.close * (2 / 21) + ema20 * (19 / 21);
     ema21 = ema21 == null ? b.close : b.close * (2 / 22) + ema21 * (20 / 22);
-    b.ema9 = ema9; b.ema21 = ema21;
+    ema26 = ema26 == null ? b.close : b.close * (2 / 27) + ema26 * (25 / 27);
+    ema50 = ema50 == null ? b.close : b.close * (2 / 51) + ema50 * (49 / 51);
+    ema200 = ema200 == null ? b.close : b.close * (2 / 201) + ema200 * (199 / 201);
+    b.ema9 = ema9; b.ema20 = ema20; b.ema21 = ema21; b.ema50 = ema50; b.ema200 = ema200;
+    b.macd = ema12 - ema26;
+    macdSignal = macdSignal == null ? b.macd : b.macd * 0.2 + macdSignal * 0.8;
+    b.macdSignal = macdSignal;
+    b.macdHist = b.macd - macdSignal;
     if (i > 0) {
       const change = b.close - bars[i - 1].close;
       const gain = Math.max(change, 0), loss = Math.max(-change, 0);
