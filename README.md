@@ -30,8 +30,10 @@ When `success: true` appears, confirm that `/backtest`, `/technical`, and `/scan
 /scan symbols:DMAS,BBCA,IMJS
 ```
 
-`/scan` without an argument uses the ticker universe stored in `idx_symbols.ts`. It first downloads one month of Daily data, calculates today's volume divided by the mean of the previous seven trading days, keeps stocks with a ratio of at least `2.0`, and selects the top five ratios. Only those five stocks proceed to the full setup scanner. The optional `symbols` argument remains available for smaller tests.
+`/scan` without an argument uses the ticker universe stored in `idx_symbols.ts`. It first downloads one month of Daily data, calculates today's volume divided by the mean of the previous seven trading days, keeps stocks with a ratio of at least `2.0`, and selects the top ten ratios. Only those ten stocks proceed to frequency enrichment, broker-summary enrichment, and the full setup scanner. The optional `symbols` argument remains available for smaller tests.
 
-For the top five, the scanner downloads native Yahoo Finance 15-minute candles for trend/confirmed pivots and native 5-minute candles for pullback, confirmation, breakout entry, stop loss, and take profit. It does not resample scanner candles. The bundled universe contains 951 codes from a public snapshot updated on 2025-02-23; update `idx_symbols.ts` when the official IDX universe changes.
+Frequency is read from Kontan's public quote page. Broker buyer/seller value and foreign net value are read from IPOTNEWS's public broker-summary table. Both enrichments are best-effort: a source failure is shown as unavailable and never suppresses the EMA result. `BRK ACC`, `BRK NTRL`, and `BRK DIST` are approximate confirmations based on the top-three displayed buyers versus sellers and the displayed foreign net value; they are not exchange-certified trade recommendations.
+
+For the top ten, the scanner downloads native Yahoo Finance 15-minute candles for trend/confirmed pivots and native 5-minute candles for pullback, confirmation, breakout entry, stop loss, and take profit. It does not resample scanner candles. The bundled universe contains 951 codes from a public snapshot updated on 2025-02-23; update `idx_symbols.ts` when the official IDX universe changes.
 
 `/backtest` keeps its existing behavior: it downloads Yahoo Finance 5-minute bars for 60 days, resamples that data to 15 minutes, tests seven strategies, applies fees and slippage, checks the final 30% as out-of-sample data, and posts the ranking plus current entry guidance to Discord.

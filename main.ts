@@ -1,5 +1,6 @@
 import axios from "npm:axios@1.12.2";
 import nacl from "npm:tweetnacl@1.0.3";
+import * as cheerio from "npm:cheerio@1.1.2";
 import { IDX_SYMBOLS, IDX_SYMBOLS_UPDATED_AT } from "./idx_symbols.ts";
 
 interface Candle {
@@ -105,7 +106,7 @@ Deno.serve(async (request: Request) => {
     }, 0);
     return jsonResponse({
       type: 4,
-      data: { content: `🔎 Memeriksa lonjakan volume **${symbols.length} emiten**. Top 5 akan dianalisis pada 15m + 5m…` },
+      data: { content: `🔎 Memeriksa lonjakan volume **${symbols.length} emiten**. Top 10 akan diperkaya dengan frequency + broker summary, lalu dianalisis pada 15m + 5m…` },
     });
   }
 
@@ -276,7 +277,7 @@ async function runScannerJob(
   rawSymbols: string[],
 ) {
   const symbols = rawSymbols.map(normalizeTicker);
-  const volumeCandidates = await findTopVolumeSpikes(symbols, 5);
+  const volumeCandidates = await findTopVolumeSpikes(symbols, 10);
   if (!volumeCandidates.length) {
     await sendChannelMessage(
       channelId,
@@ -285,7 +286,8 @@ async function runScannerJob(
     );
     return;
   }
-  const results = await mapWithConcurrency(volumeCandidates, 3, async (candidate): Promise<ScannerResult> => {
+  const enrichedCandidates = await mapWithConcurrency(volumeCandidates, 2, enrichMarketActivity);
+  const results = await mapWithConcurrency(enrichedCandidates, 3, async (candidate): Promise<ScannerResult> => {
     const symbol = candidate.symbol;
     try {
       const [raw5m, raw15m] = await Promise.all([
@@ -297,17 +299,32 @@ async function runScannerJob(
       return {
         ...analyzeSetup(candles5m, candles15m, symbol.replace(/\.JK$/, "")),
         volumeRatio7d: candidate.volumeRatio7d,
+        frequency: candidate.frequency,
+        averageLotsPerTrade: candidate.averageLotsPerTrade,
+        brokerSignal: candidate.brokerSignal,
+        brokerConfirmed: candidate.brokerSignal === "ACCUMULATION",
+        topBuyer: candidate.topBuyer,
+        topSeller: candidate.topSeller,
+        foreignNetValue: candidate.foreignNetValue,
       };
     } catch (error) {
       return {
         ...scannerErrorResult(symbol.replace(/\.JK$/, ""), discordErrorDetail(error)),
         volumeRatio7d: candidate.volumeRatio7d,
+        frequency: candidate.frequency,
+        averageLotsPerTrade: candidate.averageLotsPerTrade,
+        brokerSignal: candidate.brokerSignal,
+        brokerConfirmed: candidate.brokerSignal === "ACCUMULATION",
+        topBuyer: candidate.topBuyer,
+        topSeller: candidate.topSeller,
+        foreignNetValue: candidate.foreignNetValue,
       };
     }
   });
 
   results.sort((a, b) =>
     STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status] ||
+    Number(b.brokerConfirmed) - Number(a.brokerConfirmed) ||
     b.score - a.score ||
     a.proximityPct - b.proximityPct ||
     b.averageVolume20 - a.averageVolume20
@@ -320,6 +337,125 @@ interface VolumeCandidate {
   currentVolume: number;
   averageVolume7d: number;
   volumeRatio7d: number;
+}
+
+type BrokerSignal = "ACCUMULATION" | "NEUTRAL" | "DISTRIBUTION" | "UNAVAILABLE";
+
+interface EnrichedVolumeCandidate extends VolumeCandidate {
+  frequency: number | null;
+  averageLotsPerTrade: number | null;
+  brokerSignal: BrokerSignal;
+  topBuyer: string | null;
+  topSeller: string | null;
+  foreignNetValue: number | null;
+}
+
+interface BrokerRow {
+  code: string;
+  value: number;
+}
+
+async function enrichMarketActivity(candidate: VolumeCandidate): Promise<EnrichedVolumeCandidate> {
+  const ticker = candidate.symbol.replace(/\.JK$/, "");
+  const [frequency, broker] = await Promise.all([
+    scrapeKontanFrequency(ticker),
+    scrapeIpotBrokerSummary(ticker),
+  ]);
+  return {
+    ...candidate,
+    frequency,
+    averageLotsPerTrade: frequency && frequency > 0 ? candidate.currentVolume / 100 / frequency : null,
+    brokerSignal: broker.signal,
+    topBuyer: broker.buyers[0]?.code ?? null,
+    topSeller: broker.sellers[0]?.code ?? null,
+    foreignNetValue: broker.foreignNetValue,
+  };
+}
+
+async function fetchPublicHtml(url: string): Promise<string> {
+  const response = await axios.get(url, {
+    timeout: 30000,
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "User-Agent": "Mozilla/5.0 (compatible; IDXResearchBot/1.0)",
+    },
+  });
+  return String(response.data);
+}
+
+async function scrapeKontanFrequency(ticker: string): Promise<number | null> {
+  try {
+    const html = await fetchPublicHtml(`https://pusatdata.kontan.co.id/quote/${encodeURIComponent(ticker)}`);
+    const $ = cheerio.load(html);
+    let frequency: number | null = null;
+    $("tr").each((_, row) => {
+      const cells = $(row).find("td");
+      if ($(cells[0]).text().trim().toLowerCase() === "frequency") {
+        const parsed = parsePlainNumber($(cells[1]).text());
+        if (parsed > 0) frequency = parsed;
+      }
+    });
+    return frequency;
+  } catch {
+    return null;
+  }
+}
+
+async function scrapeIpotBrokerSummary(ticker: string): Promise<{
+  buyers: BrokerRow[];
+  sellers: BrokerRow[];
+  foreignNetValue: number | null;
+  signal: BrokerSignal;
+}> {
+  try {
+    const html = await fetchPublicHtml(
+      `https://www.indopremier.com/ipotnews/newsSmartSearch.php?code=${encodeURIComponent(ticker)}`,
+    );
+    const $ = cheerio.load(html);
+    const table = $("table").filter((_, element) => {
+      const headers = $(element).find("thead").text();
+      return headers.includes("Buyer") && headers.includes("B.Val") && headers.includes("Seller");
+    }).first();
+    if (!table.length) return { buyers: [], sellers: [], foreignNetValue: null, signal: "UNAVAILABLE" };
+
+    const buyers: BrokerRow[] = [];
+    const sellers: BrokerRow[] = [];
+    table.find("tbody tr").each((_, row) => {
+      const cells = $(row).find("td").map((__, cell) => $(cell).text().trim()).get();
+      if (cells.length < 9) return;
+      const buyValue = parseScaledNumber(cells[2]);
+      const sellValue = parseScaledNumber(cells[7]);
+      if (cells[0] && buyValue > 0) buyers.push({ code: cells[0], value: buyValue });
+      if (cells[5] && sellValue > 0) sellers.push({ code: cells[5], value: sellValue });
+    });
+    const footer = table.find("tfoot").text().replace(/\s+/g, " ");
+    const foreignMatch = footer.match(/F\.\s*NVal\s*:\s*([+-]?[\d.,]+\s*[KMBT]?)/i);
+    const foreignNetValue = foreignMatch ? parseScaledNumber(foreignMatch[1]) : null;
+    const topBuyValue = buyers.slice(0, 3).reduce((sum, row) => sum + row.value, 0);
+    const topSellValue = sellers.slice(0, 3).reduce((sum, row) => sum + row.value, 0);
+    const ratio = topSellValue > 0 ? topBuyValue / topSellValue : 1;
+    const signal: BrokerSignal = ratio >= 1.10 && (foreignNetValue == null || foreignNetValue >= 0)
+      ? "ACCUMULATION"
+      : ratio <= 0.90 && (foreignNetValue == null || foreignNetValue <= 0)
+      ? "DISTRIBUTION"
+      : "NEUTRAL";
+    return { buyers, sellers, foreignNetValue, signal };
+  } catch {
+    return { buyers: [], sellers: [], foreignNetValue: null, signal: "UNAVAILABLE" };
+  }
+}
+
+function parsePlainNumber(value: string): number {
+  const normalized = value.trim().replace(/[^\d-]/g, "");
+  return normalized ? Number(normalized) : 0;
+}
+
+function parseScaledNumber(value: string): number {
+  const match = value.trim().toUpperCase().match(/([+-]?[\d.,]+)\s*([KMBT])?/);
+  if (!match) return 0;
+  const numeric = Number(match[1].replace(/,/g, ""));
+  const multiplier = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 }[match[2] as "K" | "M" | "B" | "T"] ?? 1;
+  return numeric * multiplier;
 }
 
 async function findTopVolumeSpikes(symbols: string[], limit: number): Promise<VolumeCandidate[]> {
@@ -496,6 +632,13 @@ interface ScannerResult {
   proximityPct: number;
   averageVolume20: number;
   volumeRatio7d?: number;
+  frequency?: number | null;
+  averageLotsPerTrade?: number | null;
+  brokerSignal?: BrokerSignal;
+  brokerConfirmed?: boolean;
+  topBuyer?: string | null;
+  topSeller?: string | null;
+  foreignNetValue?: number | null;
   error?: string;
 }
 
@@ -647,7 +790,9 @@ function formatScannerReport(results: ScannerResult[], requested: number, shortl
   const rows = valid.slice(0, 10).map((r, i) => {
     const levels = r.entryPrice == null ? "" : ` | E ${rupiahPrice(r.entryPrice)} SL ${rupiahPrice(r.stopLoss)} TP ${rupiahPrice(r.takeProfit)}`;
     const volume = r.volumeRatio7d == null ? "" : ` | Vol ${r.volumeRatio7d.toFixed(2)}×`;
-    return `${i + 1}. **${r.symbol}** — ${r.status} | ${r.score}/100${volume}${levels}`;
+    const frequency = r.frequency == null ? "" : ` | F ${compactNumber(r.frequency)}`;
+    const broker = r.brokerSignal == null ? "" : ` | ${brokerLabel(r.brokerSignal)}`;
+    return `${i + 1}. **${r.symbol}** — ${r.status} | ${r.score}/100${volume}${frequency}${broker}${levels}`;
   });
   return [
     `🔎 **EMA STRUCTURE SCANNER — 15m + 5m**`,
@@ -655,10 +800,22 @@ function formatScannerReport(results: ScannerResult[], requested: number, shortl
     ...(rows.length ? rows : ["Tidak ada data yang berhasil dianalisis."]), "",
     "15m: EMA125 rising + EMA8/21 rising + HH/HL.",
     "5m: pullback → confirmation → break confirmation high.",
+    "Broker: Top 3 buyer/seller + foreign net value (konfirmasi tambahan).",
     "Pivot Length 3 hanya memakai pivot yang sudah confirmed. Candle berjalan tidak digunakan.",
     `Universe ticker diperbarui: ${IDX_SYMBOLS_UPDATED_AT}.`,
     "_Scanner teknikal bukan jaminan hasil._",
   ].join("\n").slice(0, 1950);
+}
+
+function brokerLabel(signal: BrokerSignal): string {
+  if (signal === "ACCUMULATION") return "BRK ACC";
+  if (signal === "DISTRIBUTION") return "BRK DIST";
+  if (signal === "NEUTRAL") return "BRK NTRL";
+  return "BRK N/A";
+}
+
+function compactNumber(value: number): string {
+  return new Intl.NumberFormat("id-ID", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 function latestDailyCandleStatus(unix: number) {
