@@ -21,6 +21,28 @@ function hexToBytes(hex: string) {
 }
 
 Deno.serve(async (request: Request) => {
+  const requestUrl = new URL(request.url);
+
+  // One-time protected route for registering `/backtest` globally.
+  if (request.method === "GET" && requestUrl.pathname === "/register-global") {
+    const suppliedKey = requestUrl.searchParams.get("key");
+    const registerSecret = Deno.env.get("REGISTER_SECRET");
+    if (!registerSecret || suppliedKey !== registerSecret) {
+      return jsonResponse({ error: "Unauthorized" }, 401);
+    }
+    try {
+      const command = await registerGlobalCommand();
+      return jsonResponse({
+        success: true,
+        message: "/backtest berhasil didaftarkan sebagai global command",
+        command_id: command.id,
+        command_name: command.name,
+      });
+    } catch (error) {
+      return jsonResponse({ success: false, error: discordErrorDetail(error) }, 500);
+    }
+  }
+
   if (request.method === "GET") {
     return jsonResponse({ success: true, service: "Discord IDX Backtester", status: "ready" });
   }
@@ -65,6 +87,35 @@ Deno.serve(async (request: Request) => {
     data: { content: `⏳ Backtest **${ticker}** sedang diproses…` },
   });
 });
+
+async function registerGlobalCommand() {
+  const applicationId = Deno.env.get("DISCORD_APPLICATION_ID");
+  const botToken = Deno.env.get("DISCORD_BOT_TOKEN");
+  if (!applicationId) throw new Error("DISCORD_APPLICATION_ID belum diisi.");
+  if (!botToken) throw new Error("DISCORD_BOT_TOKEN belum diisi.");
+
+  const command = {
+    name: "backtest",
+    type: 1,
+    description: "Cari strategi terbaik dan rekomendasi entry saham IDX",
+    options: [
+      { name: "ticker", description: "Kode emiten, contoh DMAS", type: 3, required: true, min_length: 2, max_length: 12 },
+      { name: "fee_beli", description: "Fee beli persen, default 0.15", type: 10, required: false, min_value: 0, max_value: 2 },
+      { name: "fee_jual", description: "Fee jual persen, default 0.25", type: 10, required: false, min_value: 0, max_value: 2 },
+      { name: "slippage", description: "Slippage persen, default 0.10", type: 10, required: false, min_value: 0, max_value: 2 },
+    ],
+  };
+
+  const response = await axios.post(
+    `https://discord.com/api/v10/applications/${applicationId}/commands`,
+    command,
+    {
+      headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
+      timeout: 30000,
+    },
+  );
+  return response.data;
+}
 
 async function runBacktestJob(
   channelId: string,
